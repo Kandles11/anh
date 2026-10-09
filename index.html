@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Infinite Five</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one full-bleed canvas of graph paper; a thin status strip floats at top, result card floats center. Major grid lines every 5 cells mark the winning length. */
+:root {
+  --paper: #edf2f0;
+  --grid: #d3dfdb;
+  --grid-major: #b3c7c1;
+  --ink-x: #1d4fa3;
+  --ink-o: #c23f2a;
+  --text: #22322e;
+  --muted: #5d716b;
+  --card: rgba(237, 242, 240, 0.92);
+  --font-display: "Instrument Serif", "Iowan Old Style", Georgia, serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #101917; --grid: #1c2926; --grid-major: #2b3e39;
+    --ink-x: #7fa9ff; --ink-o: #ff8b6e; --text: #d5e2de; --muted: #8aa29b;
+    --card: rgba(16, 25, 23, 0.9); color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #101917; --grid: #1c2926; --grid-major: #2b3e39;
+  --ink-x: #7fa9ff; --ink-o: #ff8b6e; --text: #d5e2de; --muted: #8aa29b;
+  --card: rgba(16, 25, 23, 0.9); color-scheme: dark;
+}
+html, body { height: 100%; }
+body {
+  background: var(--paper); color: var(--text);
+  overflow: hidden; overscroll-behavior: none;
+  -webkit-user-select: none; user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+#board { position: fixed; inset: 0; width: 100%; height: 100%; touch-action: none; display: block; cursor: crosshair; }
+.status {
+  position: fixed; left: 0; right: 0; top: 0;
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 16px 0;
+  display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+  font: 500 12px/1.2 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); pointer-events: none; font-variant-numeric: tabular-nums;
+}
+.status b { font-weight: 500; }
+.sx { color: var(--ink-x); } .so { color: var(--ink-o); }
+.turn { transition: opacity .2s; }
+.hint {
+  position: fixed; left: 0; right: 0; bottom: 0;
+  padding: 0 16px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  text-align: center; font: 400 12px/1.4 var(--font-mono); letter-spacing: 0.04em;
+  color: var(--muted); pointer-events: none; transition: opacity .4s;
+}
+.result {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(320px, calc(100% - 32px));
+  padding: 22px 20px 18px; text-align: center;
+  background: var(--card); border: 1px solid var(--grid-major); border-radius: 4px;
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  pointer-events: none; display: grid; gap: 6px;
+  animation: rise .35s ease-out;
+}
+.result h1 { margin: 0; font: 400 40px/1 var(--font-display); text-wrap: balance; }
+.result p { margin: 0; font: 400 12px/1.4 var(--font-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+@keyframes rise { from { opacity: 0; transform: translate(-50%, -44%); } }
+@media (prefers-reduced-motion: reduce) { .result { animation: none; } }
+</style>
+</head>
+<body>
+
+<canvas id="board" aria-label="Infinite tic-tac-toe board. Get five in a row to win."></canvas>
+<div class="status">
+  <span><b class="sx">You ✕ <span id="sYou">0</span></b> &nbsp;·&nbsp; <b class="so">CPU ○ <span id="sCpu">0</span></b></span>
+  <span class="turn" id="turn">Your move</span>
+</div>
+<div class="hint" id="hint">Tap a square · five in a row wins · drag to pan, pinch to zoom</div>
+<div class="result" id="result" hidden>
+  <h1 id="resTitle">Five in a row.</h1>
+  <p id="resSub">Tap to play again</p>
+</div>
+
+<script>
+(() => {
+  const cvs = document.getElementById('board');
+  const ctx = cvs.getContext('2d');
+  const $ = id => document.getElementById(id);
+  const HUMAN = 1, CPU = 2;
+  const DIRS = [[1,0],[0,1],[1,1],[1,-1]];
+  const MIN_SCALE = 22, MAX_SCALE = 72, MARGIN = 3;
+
+  let S; // game state
+  let W = 0, H = 0, dpr = 1;
+  const view = { cx: 0, cy: 0, scale: 56 };
+  const target = { cx: 0, cy: 0, scale: 56 };
+  let manual = false;
+  let cpuTimer = null;
+
+  const key = (x, y) => x + ',' + y;
+  const at = (x, y) => S.board[key(x, y)] || 0;
+
+  function freshState(prev) {
+    return {
+      board: {}, moves: [], over: null,
+      score: prev ? prev.score : { you: 0, cpu: 0 },
+      starter: prev ? (prev.starter === HUMAN ? CPU : HUMAN) : HUMAN,
+      turn: null,
+    };
+  }
+
+  function save() {
+    try { localStorage.setItem('infinite-five', JSON.stringify(S)); } catch (e) {}
+  }
+  function load() {
+    try { const s = JSON.parse(localStorage.getItem('infinite-five')); if (s && s.board) return s; } catch (e) {}
+    return null;
+  }
+
+  // ---------- rules ----------
+  function winLine(x, y, p) {
+    for (const [dx, dy] of DIRS) {
+      let a = 0, b = 0;
+      while (at(x + (a + 1) * dx, y + (a + 1) * dy) === p) a++;
+      while (at(x - (b + 1) * dx, y - (b + 1) * dy) === p) b++;
+      if (a + b + 1 >= 5) return [x - b * dx, y - b * dy, x + a * dx, y + a * dy];
+    }
+    return null;
+  }
+
+  // ---------- CPU ----------
+  const WT = [0, 1, 12, 120, 1500, 1e7];
+  function cellScore(x, y, p) {
+    const opp = p === HUMAN ? CPU : HUMAN;
+    let s = 0;
+    for (const [dx, dy] of DIRS) {
+      for (let off = 0; off < 5; off++) {
+        let count = 0, dead = false;
+        for (let i = 0; i < 5; i++) {
+          const k = i - off;
+          if (k === 0) { count++; continue; }
+          const v = at(x + k * dx, y + k * dy);
+          if (v === opp) { dead = true; break; }
+          if (v === p) count++;
+        }
+        if (!dead) s += WT[count];
+      }
+    }
+    return s;
+  }
+  function cpuPick() {
+    if (!S.moves.length) return [0, 0];
+    const cand = new Set();
+    for (const m of S.moves) {
+      for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+        const x = m.x + dx, y = m.y + dy;
+        if (!at(x, y)) cand.add(key(x, y));
+      }
+    }
+    let best = null, bestS = -1;
+    for (const k of cand) {
+      const [x, y] = k.split(',').map(Number);
+      const s = cellScore(x, y, CPU) * 1.08 + cellScore(x, y, HUMAN) + Math.random() * 3;
+      if (s > bestS) { bestS = s; best = [x, y]; }
+    }
+    return best;
+  }
+
+  // ---------- moves ----------
+  function place(x, y, p) {
+    if (S.over || at(x, y) || S.turn !== p) return false;
+    S.board[key(x, y)] = p;
+    S.moves.push({ x, y, p, t: performance.now() });
+    const line = winLine(x, y, p);
+    if (line) {
+      S.over = { winner: p, line, t: performance.now() };
+      if (p === HUMAN) S.score.you++; else S.score.cpu++;
+    } else {
+      S.turn = p === HUMAN ? CPU : HUMAN;
+    }
+    manual = false;
+    fitTarget();
+    updateUI();
+    save();
+    if (!S.over && S.turn === CPU) scheduleCpu();
+    return true;
+  }
+  function scheduleCpu() {
+    clearTimeout(cpuTimer);
+    cpuTimer = setTimeout(() => { const [x, y] = cpuPick(); place(x, y, CPU); }, 380);
+  }
+  function newGame() {
+    S = freshState(S);
+    S.turn = S.starter;
+    manual = false; fitTarget();
+    updateUI(); save();
+    if (S.turn === CPU) scheduleCpu();
+  }
+
+  function updateUI() {
+    $('sYou').textContent = S.score.you;
+    $('sCpu').textContent = S.score.cpu;
+    const t = $('turn');
+    if (S.over) t.textContent = S.over.winner === HUMAN ? 'You win' : 'CPU wins';
+    else t.textContent = S.turn === HUMAN ? 'Your move' : 'CPU thinking…';
+    t.className = 'turn ' + (S.turn === HUMAN ? 'sx' : 'so');
+    $('hint').style.opacity = S.moves.length < 2 ? 1 : 0;
+    const r = $('result');
+    if (S.over) {
+      $('resTitle').textContent = S.over.winner === HUMAN ? 'Five in a row.' : 'The CPU got five.';
+      $('resSub').textContent = 'Tap to play again';
+      setTimeout(() => { if (S.over) r.hidden = false; }, 700);
+    } else r.hidden = true;
+  }
+
+  // ---------- view ----------
+  function fitTarget() {
+    let minX = 0, maxX = 0, minY = 0, maxY = 0;
+    if (S.moves.length) {
+      minX = minY = Infinity; maxX = maxY = -Infinity;
+      for (const m of S.moves) {
+        minX = Math.min(minX, m.x); maxX = Math.max(maxX, m.x);
+        minY = Math.min(minY, m.y); maxY = Math.max(maxY, m.y);
+      }
+    }
+    const topPad = 48, botPad = 40;
+    const w = maxX - minX + 1 + MARGIN * 2;
+    const h = maxY - minY + 1 + MARGIN * 2;
+    const availH = Math.max(100, H - topPad - botPad);
+    let sc = Math.min(W / w, availH / h);
+    sc = Math.max(MIN_SCALE, Math.min(MAX_SCALE, sc));
+    target.scale = sc;
+    target.cx = (minX + maxX) / 2;
+    target.cy = (minY + maxY) / 2 - (topPad - botPad) / 2 / sc;
+    // if the board is wider than the screen, keep the latest move in view
+    const last = S.moves[S.moves.length - 1];
+    if (last) {
+      const hw = W / 2 / sc - 1.5, hh = availH / 2 / sc - 1.5;
+      if (Math.abs(last.x - target.cx) > hw) target.cx = last.x - Math.sign(last.x - target.cx) * hw;
+      if (Math.abs(last.y - target.cy) > hh) target.cy = last.y - Math.sign(last.y - target.cy) * hh;
+    }
+  }
+  const toWorld = (sx, sy) => [(sx - W / 2) / view.scale + view.cx, (sy - H / 2) / view.scale + view.cy];
+
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 3);
+    W = window.innerWidth; H = window.innerHeight;
+    cvs.width = Math.round(W * dpr); cvs.height = Math.round(H * dpr);
+    if (!manual) fitTarget();
+  }
+
+  // ---------- drawing ----------
+  const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  function draw(now) {
+    if (!manual) {
+      const k = reduce ? 1 : 0.14;
+      view.cx += (target.cx - view.cx) * k;
+      view.cy += (target.cy - view.cy) * k;
+      view.scale += (target.scale - view.scale) * k;
+    }
+    const cs = getComputedStyle(document.documentElement);
+    const col = n => cs.getPropertyValue(n).trim();
+    const paper = col('--paper'), grid = col('--grid'), major = col('--grid-major');
+    const inkX = col('--ink-x'), inkO = col('--ink-o');
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = paper; ctx.fillRect(0, 0, W, H);
+
+    const s = view.scale;
+    const [wx0, wy0] = toWorld(0, 0), [wx1, wy1] = toWorld(W, H);
+    const sx = x => (x - view.cx) * s + W / 2;
+    const sy = y => (y - view.cy) * s + H / 2;
+
+    // grid: lines sit on half-integers; every 5th is major
+    ctx.lineWidth = 1;
+    for (let gx = Math.floor(wx0 - 0.5); gx <= wx1 + 0.5; gx++) {
+      const X = Math.round(sx(gx + 0.5)) + 0.5;
+      ctx.strokeStyle = ((gx % 5) + 5) % 5 === 2 ? major : grid;
+      ctx.beginPath(); ctx.moveTo(X, 0); ctx.lineTo(X, H); ctx.stroke();
+    }
+    for (let gy = Math.floor(wy0 - 0.5); gy <= wy1 + 0.5; gy++) {
+      const Y = Math.round(sy(gy + 0.5)) + 0.5;
+      ctx.strokeStyle = ((gy % 5) + 5) % 5 === 2 ? major : grid;
+      ctx.beginPath(); ctx.moveTo(0, Y); ctx.lineTo(W, Y); ctx.stroke();
+    }
+
+    // pieces
+    ctx.lineCap = 'round';
+    const lw = Math.max(2, s * 0.09);
+    const r = s * 0.3;
+    for (const m of S.moves) {
+      const X = sx(m.x), Y = sy(m.y);
+      if (X < -s || X > W + s || Y < -s || Y > H + s) continue;
+      const age = reduce ? 1 : Math.min(1, (now - (m.t || 0)) / 220);
+      const e = 1 - Math.pow(1 - age, 3);
+      ctx.lineWidth = lw;
+      if (m.p === HUMAN) {
+        ctx.strokeStyle = inkX;
+        const a = Math.min(1, e * 2), b = Math.max(0, e * 2 - 1);
+        ctx.beginPath(); ctx.moveTo(X - r, Y - r); ctx.lineTo(X - r + 2 * r * a, Y - r + 2 * r * a); ctx.stroke();
+        if (b > 0) { ctx.beginPath(); ctx.moveTo(X + r, Y - r); ctx.lineTo(X + r - 2 * r * b, Y - r + 2 * r * b); ctx.stroke(); }
+      } else {
+        ctx.strokeStyle = inkO;
+        ctx.beginPath(); ctx.arc(X, Y, r * 1.02, -Math.PI / 2, -Math.PI / 2 + Math.PI * 2 * e); ctx.stroke();
+      }
+    }
+
+    // last move marker
+    const last = S.moves[S.moves.length - 1];
+    if (last && !S.over) {
+      ctx.strokeStyle = last.p === HUMAN ? inkX : inkO;
+      ctx.globalAlpha = 0.35; ctx.lineWidth = 1.5;
+      const h = s / 2 - 2;
+      ctx.strokeRect(sx(last.x) - h, sy(last.y) - h, h * 2, h * 2);
+      ctx.globalAlpha = 1;
+    }
+
+    // winning stroke
+    if (S.over) {
+      const [x0, y0, x1, y1] = S.over.line;
+      const p = reduce ? 1 : Math.min(1, Math.max(0, (now - (S.over.t || 0) - 200) / 400));
+      const ex = 0.45;
+      const dx = Math.sign(x1 - x0), dy = Math.sign(y1 - y0);
+      const ax = sx(x0 - dx * ex), ay = sy(y0 - dy * ex);
+      const bx = sx(x1 + dx * ex), by = sy(y1 + dy * ex);
+      ctx.strokeStyle = S.over.winner === HUMAN ? inkX : inkO;
+      ctx.lineWidth = Math.max(3, s * 0.12);
+      ctx.beginPath(); ctx.moveTo(ax, ay); ctx.lineTo(ax + (bx - ax) * p, ay + (by - ay) * p); ctx.stroke();
+    }
+    requestAnimationFrame(draw);
+  }
+
+  // ---------- input ----------
+  const ptrs = new Map();
+  let gesture = null; // {type:'tap'|'pan'|'pinch', ...}
+
+  cvs.addEventListener('pointerdown', e => {
+    cvs.setPointerCapture(e.pointerId);
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (ptrs.size === 1) {
+      gesture = { type: 'tap', sx: e.clientX, sy: e.clientY, cx: view.cx, cy: view.cy };
+    } else if (ptrs.size === 2) {
+      const [a, b] = [...ptrs.values()];
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      gesture = { type: 'pinch', d: Math.hypot(a.x - b.x, a.y - b.y), scale: view.scale, world: toWorld(mx, my) };
+      manual = true;
+    }
+  });
+  cvs.addEventListener('pointermove', e => {
+    if (!ptrs.has(e.pointerId) || !gesture) return;
+    ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (gesture.type === 'tap' && Math.hypot(e.clientX - gesture.sx, e.clientY - gesture.sy) > 8) {
+      gesture.type = 'pan'; manual = true;
+    }
+    if (gesture.type === 'pan') {
+      view.cx = gesture.cx - (e.clientX - gesture.sx) / view.scale;
+      view.cy = gesture.cy - (e.clientY - gesture.sy) / view.scale;
+    } else if (gesture.type === 'pinch' && ptrs.size >= 2) {
+      const [a, b] = [...ptrs.values()];
+      const d = Math.hypot(a.x - b.x, a.y - b.y);
+      const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+      view.scale = Math.max(10, Math.min(110, gesture.scale * d / gesture.d));
+      view.cx = gesture.world[0] - (mx - W / 2) / view.scale;
+      view.cy = gesture.world[1] - (my - H / 2) / view.scale;
+    }
+  });
+  function endPtr(e) {
+    if (!ptrs.has(e.pointerId)) return;
+    ptrs.delete(e.pointerId);
+    if (gesture && gesture.type === 'tap' && ptrs.size === 0) tap(e.clientX, e.clientY);
+    if (ptrs.size === 0) gesture = null;
+    else if (gesture && gesture.type === 'pinch') {
+      const [a] = [...ptrs.values()];
+      gesture = { type: 'pan', sx: a.x, sy: a.y, cx: view.cx, cy: view.cy };
+    }
+  }
+  cvs.addEventListener('pointerup', endPtr);
+  cvs.addEventListener('pointercancel', e => { ptrs.delete(e.pointerId); if (!ptrs.size) gesture = null; });
+  cvs.addEventListener('wheel', e => {
+    e.preventDefault(); manual = true;
+    const before = toWorld(e.clientX, e.clientY);
+    view.scale = Math.max(10, Math.min(110, view.scale * Math.exp(-e.deltaY * 0.0015)));
+    view.cx = before[0] - (e.clientX - W / 2) / view.scale;
+    view.cy = before[1] - (e.clientY - H / 2) / view.scale;
+  }, { passive: false });
+
+  function tap(x, y) {
+    if (S.over) {
+      if (performance.now() - (S.over.t || 0) > 700) newGame();
+      return;
+    }
+    if (S.turn !== HUMAN) return;
+    const [wx, wy] = toWorld(x, y);
+    place(Math.round(wx), Math.round(wy), HUMAN);
+  }
+
+  // ---------- boot ----------
+  function start(data) {
+    S = (data && data.state) || load() || null;
+    if (!S) { S = freshState(null); S.turn = S.starter; }
+    if (S.over) S.over.t = 0;
+    for (const m of S.moves) m.t = 0;
+    resize();
+    view.cx = target.cx; view.cy = target.cy; view.scale = target.scale;
+    updateUI();
+    if (!S.over && S.turn === CPU) scheduleCpu();
+    requestAnimationFrame(draw);
+  }
+  window.addEventListener('resize', () => { resize(); });
+  window.claude?.hot?.snapshot?.(() => ({ state: S }));
+  window.claude?.hot?.ready ? window.claude.hot.ready(start) : start(window.claude?.hot?.data ?? {});
+})();
+</script>
+</body>
+</html>
